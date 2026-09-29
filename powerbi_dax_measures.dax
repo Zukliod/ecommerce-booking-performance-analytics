@@ -1,0 +1,352 @@
+/* ============================================================================
+   POWER BI DAX MEASURES & DATA MODELING SPECIFICATION
+   Data Model: Enterprise Star Schema
+   Tables:
+     - Fact_Bookings
+     - Fact_Funnel
+     - Dim_Customer
+     - Dim_Date (Calendar)
+     - Dim_Campaign
+     - Dim_Service
+   ============================================================================ */
+
+-- ============================================================================
+-- 1. CORE BASE MEASURES (FACT_BOOKINGS)
+-- ============================================================================
+
+[Total Bookings] = 
+COUNTROWS(Fact_Bookings)
+
+[Total Completed Bookings] = 
+CALCULATE(
+    [Total Bookings],
+    KEEPFILTERS(Fact_Bookings[booking_status] = "Completed")
+)
+
+[Total Cancelled Bookings] = 
+CALCULATE(
+    [Total Bookings],
+    KEEPFILTERS(Fact_Bookings[booking_status] = "Cancelled")
+)
+
+[Total Refunded Bookings] = 
+CALCULATE(
+    [Total Bookings],
+    KEEPFILTERS(Fact_Bookings[booking_status] = "Refunded")
+)
+
+[Total Gross Booking Value] = 
+SUM(Fact_Bookings[gross_booking_value])
+
+[Total Discounts Applied] = 
+SUM(Fact_Bookings[discount_applied])
+
+[Total Net Revenue] = 
+CALCULATE(
+    SUMX(
+        Fact_Bookings,
+        Fact_Bookings[gross_booking_value] - COALESCE(Fact_Bookings[discount_applied], 0)
+    ),
+    KEEPFILTERS(Fact_Bookings[booking_status] = "Completed")
+)
+
+[Average Order Value (AOV)] = 
+DIVIDE([Total Net Revenue], [Total Completed Bookings], 0)
+
+
+-- ============================================================================
+-- 2. CANCELLATION RATE WITH TIME INTELLIGENCE
+-- ============================================================================
+
+[Cancellation Rate] = 
+DIVIDE(
+    [Total Cancelled Bookings],
+    [Total Bookings],
+    0
+)
+
+[Cancellation Rate (Incl. Refunds)] = 
+DIVIDE(
+    [Total Cancelled Bookings] + [Total Refunded Bookings],
+    [Total Bookings],
+    0
+)
+
+[Cancellation Rate MTD] = 
+VAR TotalMTD = CALCULATE([Total Bookings], DATESMTD(Dim_Date[Date]))
+VAR CancelledMTD = CALCULATE([Total Cancelled Bookings], DATESMTD(Dim_Date[Date]))
+RETURN
+    DIVIDE(CancelledMTD, TotalMTD, BLANK())
+
+[Cancellation Rate YTD] = 
+VAR TotalYTD = CALCULATE([Total Bookings], DATESYTD(Dim_Date[Date]))
+VAR CancelledYTD = CALCULATE([Total Cancelled Bookings], DATESYTD(Dim_Date[Date]))
+RETURN
+    DIVIDE(CancelledYTD, TotalYTD, BLANK())
+
+[Cancellation Rate Prior Month] = 
+CALCULATE(
+    [Cancellation Rate],
+    DATEADD(Dim_Date[Date], -1, MONTH)
+)
+
+[Cancellation Rate MoM % Change] = 
+VAR CurrentRate = [Cancellation Rate]
+VAR PriorRate = [Cancellation Rate Prior Month]
+RETURN
+    IF(
+        NOT ISBLANK(CurrentRate) && NOT ISBLANK(PriorRate),
+        CurrentRate - PriorRate, -- Percentage point difference (e.g. +1.5%)
+        BLANK()
+    )
+
+[Cancellation Rate SPLY] = 
+CALCULATE(
+    [Cancellation Rate],
+    SAMEPERIODLASTYEAR(Dim_Date[Date])
+)
+
+[Cancellation Rate YoY % Change] = 
+VAR CurrentRate = [Cancellation Rate]
+VAR PriorYearRate = [Cancellation Rate SPLY]
+RETURN
+    IF(
+        NOT ISBLANK(CurrentRate) && NOT ISBLANK(PriorYearRate),
+        CurrentRate - PriorYearRate,
+        BLANK()
+    )
+
+
+-- ============================================================================
+-- 3. CUSTOMER LIFETIME VALUE (CLV) COHORT DYNAMICS
+-- ============================================================================
+-- Modeled across Customer Cohort Month vs Calendar Month or Normalized Month Index
+
+-- A. Dynamic Cumulative Revenue per Customer Cohort
+[Cohort Cumulative Revenue] = 
+VAR CurrentCohortDate = MIN(Dim_Customer[signup_date])
+VAR CurrentCohortMonth = MIN(Dim_Customer[cohort_month_start])
+VAR MaxVisibleDate = MAX(Dim_Date[Date])
+RETURN
+IF(
+    -- Only calculate for periods on or after the cohort inception
+    MAX(Dim_Date[Date]) >= CurrentCohortMonth,
+    CALCULATE(
+        [Total Net Revenue],
+        FILTER(
+            ALL(Dim_Date),
+            Dim_Date[Date] <= MaxVisibleDate &&
+            Dim_Date[Date] >= CurrentCohortMonth
+        )
+    ),
+    BLANK()
+)
+
+-- B. Cohort Size (Distinct Customers in Cohort)
+[Cohort Initial Customers] = 
+CALCULATE(
+    DISTINCTCOUNT(Dim_Customer[customer_id]),
+    ALLEXCEPT(Dim_Customer, Dim_Customer[customer_cohort_month])
+)
+
+-- C. Customer Lifetime Value (Cumulative Revenue per Customer in Cohort)
+[Customer Lifetime Value (CLV)] = 
+DIVIDE(
+    [Cohort Cumulative Revenue],
+    [Cohort Initial Customers],
+    BLANK()
+)
+
+-- D. Normalized Relative Month Index CLV (Month 0, Month 1, Month 2, ...)
+-- Requires an auxiliary disconnected table 'Dim_CohortIndex' with column [Month_Index] (0, 1, 2, ..., 24)
+[CLV Normalized Month] = 
+VAR SelectedIndex = SELECTEDVALUE(Dim_CohortIndex[Month_Index])
+VAR CohortCustomers = [Cohort Initial Customers]
+VAR CumulativeRevenueAtIndex = 
+    CALCULATE(
+        [Total Net Revenue],
+        FILTER(
+            ALL(Dim_Date),
+            VAR SignupMonth = MIN(Dim_Customer[cohort_month_start])
+            VAR TargetMonthStart = EDATE(SignupMonth, SelectedIndex)
+            VAR TargetMonthEnd = EOMONTH(TargetMonthStart, 0)
+            RETURN
+                Dim_Date[Date] <= TargetMonthEnd &&
+                Dim_Date[Date] >= SignupMonth
+        )
+    )
+RETURN
+    IF(
+        NOT ISBLANK(SelectedIndex) && CohortCustomers > 0,
+        DIVIDE(CumulativeRevenueAtIndex, CohortCustomers, BLANK()),
+        BLANK()
+    )
+
+
+-- ============================================================================
+-- 4. MONTH-OVER-MONTH (MoM) CUSTOMER RETENTION RATE
+-- ============================================================================
+-- Percentage of users who booked in month T who also booked in month T-1.
+-- Formula: Count(Customers active in T AND T-1) / Count(Customers active in T-1)
+
+[Active Customers Current Month] = 
+CALCULATE(
+    DISTINCTCOUNT(Fact_Bookings[customer_id]),
+    Fact_Bookings[booking_status] = "Completed"
+)
+
+[Active Customers Prior Month] = 
+CALCULATE(
+    DISTINCTCOUNT(Fact_Bookings[customer_id]),
+    DATEADD(Dim_Date[Date], -1, MONTH),
+    Fact_Bookings[booking_status] = "Completed"
+)
+
+[MoM Customer Retention Rate] = 
+VAR HasActiveCurrentPeriod = NOT ISBLANK([Total Bookings])
+VAR CurrentMonthCustomers = 
+    CALCULATETABLE(
+        VALUES(Fact_Bookings[customer_id]),
+        Fact_Bookings[booking_status] = "Completed"
+    )
+VAR PriorMonthCustomers = 
+    CALCULATETABLE(
+        VALUES(Fact_Bookings[customer_id]),
+        DATEADD(Dim_Date[Date], -1, MONTH),
+        Fact_Bookings[booking_status] = "Completed"
+    )
+-- Retained customers are the intersection of both active sets
+VAR RetainedCustomers = 
+    INTERSECT(CurrentMonthCustomers, PriorMonthCustomers)
+VAR RetainedCount = COUNTROWS(RetainedCustomers)
+VAR PriorCount = COUNTROWS(PriorMonthCustomers)
+RETURN
+    IF(
+        HasActiveCurrentPeriod && PriorCount > 0,
+        DIVIDE(RetainedCount, PriorCount, BLANK()),
+        BLANK()
+    )
+
+-- Forward Retention Rate: Percentage of Month T customers who return in Month T+1
+[MoM Forward Retention Rate] = 
+VAR HasActiveCurrentPeriod = NOT ISBLANK([Total Bookings])
+VAR CurrentMonthCustomers = 
+    CALCULATETABLE(
+        VALUES(Fact_Bookings[customer_id]),
+        Fact_Bookings[booking_status] = "Completed"
+    )
+VAR NextMonthCustomers = 
+    CALCULATETABLE(
+        VALUES(Fact_Bookings[customer_id]),
+        DATEADD(Dim_Date[Date], 1, MONTH),
+        Fact_Bookings[booking_status] = "Completed"
+    )
+VAR ReturningCustomers = 
+    INTERSECT(CurrentMonthCustomers, NextMonthCustomers)
+VAR ReturningCount = COUNTROWS(ReturningCustomers)
+VAR CurrentCount = COUNTROWS(CurrentMonthCustomers)
+RETURN
+    IF(
+        HasActiveCurrentPeriod && CurrentCount > 0,
+        DIVIDE(ReturningCount, CurrentCount, BLANK()),
+        BLANK()
+    )
+
+
+-- ============================================================================
+-- 5. BOOKING CONVERSION FUNNEL MODELING
+-- ============================================================================
+-- Funnel Path: 1. Search -> 2. Selection -> 3. Payment Initiated -> 4. Completed Transaction
+
+[Funnel Total Sessions] = 
+DISTINCTCOUNT(Fact_Funnel[session_id])
+
+[Step 1 - Search Sessions] = 
+CALCULATE(
+    [Funnel Total Sessions],
+    Fact_Funnel[stage_order] = 1
+)
+
+[Step 2 - Selection Sessions] = 
+CALCULATE(
+    [Funnel Total Sessions],
+    Fact_Funnel[stage_order] = 2
+)
+
+[Step 3 - Payment Initiated Sessions] = 
+CALCULATE(
+    [Funnel Total Sessions],
+    Fact_Funnel[stage_order] = 3
+)
+
+[Step 4 - Completed Transactions] = 
+CALCULATE(
+    [Funnel Total Sessions],
+    Fact_Funnel[stage_order] = 4
+)
+
+-- Stage-to-Stage Transition Conversion Rates
+[Conv Search to Selection] = 
+DIVIDE([Step 2 - Selection Sessions], [Step 1 - Search Sessions], 0)
+
+[Conv Selection to Payment] = 
+DIVIDE([Step 3 - Payment Initiated Sessions], [Step 2 - Selection Sessions], 0)
+
+[Conv Payment to Completed] = 
+DIVIDE([Step 4 - Completed Transactions], [Step 3 - Payment Initiated Sessions], 0)
+
+-- Overall End-to-End Funnel Conversion Rate
+[Overall Funnel Conversion Rate] = 
+DIVIDE([Step 4 - Completed Transactions], [Step 1 - Search Sessions], 0)
+
+-- Dynamic Funnel Measure (Supports Standard Funnel / Bar Visual with Dim_FunnelStage)
+[Funnel Stage Volume] = 
+VAR CurrentStageOrder = SELECTEDVALUE(Dim_FunnelStage[stage_order])
+RETURN
+    CALCULATE(
+        [Funnel Total Sessions],
+        Fact_Funnel[stage_order] = CurrentStageOrder
+    )
+
+[Funnel Conversion from Previous Step %] = 
+VAR CurrentStageOrder = SELECTEDVALUE(Dim_FunnelStage[stage_order])
+VAR CurrentStageVolume = [Funnel Stage Volume]
+VAR PreviousStageVolume = 
+    CALCULATE(
+        [Funnel Total Sessions],
+        Fact_Funnel[stage_order] = CurrentStageOrder - 1,
+        ALLSELECTED(Dim_FunnelStage)
+    )
+RETURN
+    IF(
+        CurrentStageOrder = 1,
+        1.0, -- Top of funnel is 100%
+        DIVIDE(CurrentStageVolume, PreviousStageVolume, BLANK())
+    )
+
+[Funnel Conversion from Top of Funnel %] = 
+VAR CurrentStageVolume = [Funnel Stage Volume]
+VAR TopOfFunnelVolume = 
+    CALCULATE(
+        [Funnel Total Sessions],
+        Fact_Funnel[stage_order] = 1,
+        ALLSELECTED(Dim_FunnelStage)
+    )
+RETURN
+    DIVIDE(CurrentStageVolume, TopOfFunnelVolume, BLANK())
+
+[Funnel Drop-off Volume] = 
+VAR CurrentStageOrder = SELECTEDVALUE(Dim_FunnelStage[stage_order])
+VAR CurrentStageVolume = [Funnel Stage Volume]
+VAR NextStageVolume = 
+    CALCULATE(
+        [Funnel Total Sessions],
+        Fact_Funnel[stage_order] = CurrentStageOrder + 1,
+        ALLSELECTED(Dim_FunnelStage)
+    )
+RETURN
+    IF(
+        ISBLANK(NextStageVolume),
+        BLANK(),
+        CurrentStageVolume - NextStageVolume
+    )

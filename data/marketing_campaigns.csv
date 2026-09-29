@@ -1,0 +1,11 @@
+campaign_id,campaign_name,discount_code,channel
+CMP_001,Summer Vacation Blitz,SUMMER20,Paid Search
+CMP_002,Year-End Holiday Escapes,HOLIDAY25,Social
+CMP_003,New User Welcome Gift,WELCOME15,Paid Search
+CMP_004,Spring Break Getaway,SPRING10,Social
+CMP_005,Influencer Wanderlust Promo,WANDERLUST,Social
+CMP_006,Refer-A-Friend Program,REF25OFF,Referral
+CMP_007,Corporate Partner Advantage,CORPPERK,Referral
+CMP_008,Organic SEO Early Bird,EARLYBIRD,Organic
+CMP_009,Autumn Weekend Escapes,FALL10,Organic
+CMP_010,Google Flight Search SEM,FLYSEM,Paid Search
